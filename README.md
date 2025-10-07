@@ -167,10 +167,6 @@ void MatMulGPU(byte[] A, byte[] B, byte[] C, int M, int N, int K, bool useDouble
 
 MIT
 
-## Author
-
-Your Name
-
 ## Contributing
 
 Contributions welcome! Please open an issue or PR.
