@@ -1,13 +1,13 @@
 # Posit8.Net
 
-Posit8es1 arithmetic library using precomputed lookup tables. Supports CPU and GPU (OpenCL) operations with 4x memory savings vs Float32.
+Posit8es1 arithmetic library using precomputed lookup tables. Supports CPU and GPU (OpenCL) operations.
 
 ## Features
 
-- **O(1) Operations**: All arithmetic ops (add, mul, sub, div) via lookup tables
-- **Memory Efficient**: 8-bit posit vs 32-bit float = 4x smaller models
-- **GPU Accelerated**: OpenCL support for parallel matrix operations
-- **ML Ready**: Suitable for inference where memory bandwidth matters
+- Arithmetic operations via lookup tables
+- 8-bit storage (4x smaller than 32-bit float)
+- OpenCL support for GPU matrix operations
+- Parallel CPU matrix operations
 
 ## Installation
 
@@ -26,18 +26,18 @@ using Posit8.Net;
 byte p1 = Posit8Tables.EncodeDouble(3.5);
 byte p2 = Posit8Tables.EncodeDouble(2.0);
 
-// Arithmetic (O(1) table lookups)
+// Arithmetic
 byte sum = Posit8Tables.Add(p1, p2);
 byte product = Posit8Tables.Mul(p1, p2);
 
 // Decode back to double
-double result = Posit8Tables.ToDouble(product);  // 7.0
+double result = Posit8Tables.ToDouble(product);
 ```
 
 ### Vector Operations
 
 ```csharp
-// Dot product (double accumulation)
+// Dot product
 byte[] vecA = new byte[1000];
 byte[] vecB = new byte[1000];
 
@@ -56,16 +56,20 @@ byte[] matrixC = new byte[size * size];
 
 // ... fill matrices ...
 
-// CPU: Double accumulation (recommended for accuracy)
+// Single-threaded
 Posit8Tables.MatMulDouble(matrixA, matrixB, matrixC, size, size, size);
+
+// Parallel
+Posit8Tables.MatMulDoubleParallel(matrixA, matrixB, matrixC, size, size, size);
 ```
 
 ### Matrix Multiplication (GPU)
 
 ```csharp
-// Initialize OpenCL
-if (Posit8OpenCL.Initialize())
+try
 {
+    using var gpu = new Posit8OpenCL();
+
     int size = 3072;
     byte[] matrixA = new byte[size * size];
     byte[] matrixB = new byte[size * size];
@@ -73,35 +77,28 @@ if (Posit8OpenCL.Initialize())
 
     // ... fill matrices ...
 
-    // GPU acceleration
-    Posit8OpenCL.MatMulGPU(matrixA, matrixB, matrixC,
-                           size, size, size,
-                           useDoubleAccum: true);
-
-    // Cleanup
-    Posit8OpenCL.Cleanup();
+    gpu.MatMul(matrixA, matrixB, matrixC, size, size, size);
+}
+catch (Posit8OpenCLException ex)
+{
+    Console.WriteLine($"OpenCL not available: {ex.Message}");
 }
 ```
 
 ## Performance
 
-### Characteristics
+- Memory: 4x smaller than 32-bit float
+- CPU operations use lookup tables
+- GPU operations via OpenCL
 
-- **Memory**: 4x smaller than Float32 (8-bit vs 32-bit)
-- **CPU**: Lookup table operations, performance depends on cache efficiency
-- **GPU**: OpenCL acceleration for matrix operations on compatible hardware
-- **Trade-offs**: Lower precision (8-bit) for reduced memory bandwidth
-
-Performance will vary based on hardware, matrix size, and workload. Benchmark on your target platform for specific use cases.
+Performance varies by hardware, matrix size, and workload.
 
 ## Precision
 
-- **Format**: 8-bit posit with limited precision compared to float32
-- **Accumulation**: Errors can compound in large matrix operations
-- **Suitable for**: ML inference, approximate computing, compression
-- **Not suitable for**: High-precision scientific computing, financial calculations
-
-Posit8 trades precision for memory efficiency. Test accuracy on your specific workload before production use.
+- 8-bit format with limited precision
+- Matrix operations accumulate in double precision
+- Suitable for: ML inference, approximate computing, compression
+- Not suitable for: High-precision scientific computing, financial calculations
 
 ## API Reference
 
@@ -135,12 +132,14 @@ double DotProduct(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
 ### Matrix Operations
 
 ```csharp
-// CPU
-void MatMul(ReadOnlySpan<byte> A, ReadOnlySpan<byte> B, Span<byte> C, int m, int k, int n)
+// CPU single-threaded
 void MatMulDouble(ReadOnlySpan<byte> A, ReadOnlySpan<byte> B, Span<byte> C, int m, int k, int n)
 
-// GPU
-void MatMulGPU(byte[] A, byte[] B, byte[] C, int M, int N, int K, bool useDoubleAccum)
+// CPU parallel
+void MatMulDoubleParallel(byte[] A, byte[] B, byte[] C, int m, int k, int n)
+
+// GPU via OpenCL
+void MatMul(byte[] A, byte[] B, byte[] C, int M, int N, int K)
 ```
 
 ## Requirements
@@ -151,22 +150,20 @@ void MatMulGPU(byte[] A, byte[] B, byte[] C, int M, int N, int K, bool useDouble
 
 ## Use Cases
 
-- **ML Model Inference**: Compress models by 4x, reduce memory bandwidth
-- **Embedded Systems**: Reduced memory footprint
-- **Edge AI**: Deploy larger models on memory-constrained devices
-- **Approximate Computing**: Where memory efficiency matters more than precision
+- ML model inference
+- Embedded systems
+- Approximate computing
 
 ## Technical Details
 
-- **Format**: Posit8es1 (8-bit, exponent size = 1)
-- **Range**: ±4096 with tapered precision
-- **Tables**: ~130KB (fits in L2 cache)
-- **NaR**: 0x80 (Not a Real - like NaN)
+- Format: Posit8es1 (8-bit, exponent size = 1)
+- Range: ±4096 with tapered precision
+- CPU tables: ~260KB (4 × 64KB tables + utilities)
+- GPU memory: 2KB lookup table
+- NaR: 0x80 (Not a Real)
+- Rounding: Round-to-nearest-ties-to-even with carry propagation
+- Matrix operations use double precision accumulation
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.

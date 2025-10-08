@@ -33,4 +33,16 @@
     <EmbeddedResource Include="posit8_kernel.cl" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Posit8.Net.Tests\**" />
+    <EmbeddedResource Remove="Posit8.Net.Tests\**" />
+    <None Remove="Posit8.Net.Tests\**" />
+    <Compile Remove="Posit8.Net.Benchmarks\**" />
+    <EmbeddedResource Remove="Posit8.Net.Benchmarks\**" />
+    <None Remove="Posit8.Net.Benchmarks\**" />
+    <Compile Remove="Posit8.Net.Samples\**" />
+    <EmbeddedResource Remove="Posit8.Net.Samples\**" />
+    <None Remove="Posit8.Net.Samples\**" />
+  </ItemGroup>
+
 </Project>

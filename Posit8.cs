@@ -1,8 +1,5 @@
 ﻿using System;
-using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
-using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
 
 /// <summary>
 /// Ultra-fast Posit8es1 implementation using precomputed lookup tables.
@@ -15,8 +12,8 @@ public static class Posit8Tables
     
     // Lookup tables (256 entries each)
     private static readonly double[] ToDoubleTable = new double[256];
-    private static readonly byte[] FromDoubleTable = new byte[256]; // Simplified, see note
-    
+
+
     // Operation tables (256x256 = 64KB each)
     private static readonly byte[,] AddTable = new byte[256, 256];
     private static readonly byte[,] MulTable = new byte[256, 256];
@@ -44,9 +41,6 @@ public static class Posit8Tables
         {
             ToDoubleTable[i] = DecodePositBits((byte)i);
         }
-        
-        // Note: FromDouble is a simplification - real implementation would need
-        // a hash table or search. For demo, we'll use direct encoding.
     }
     
     private static void BuildArithmeticTables()
@@ -172,36 +166,36 @@ public static class Posit8Tables
     /// Encode a double to Posit8 using pure bit operations.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static byte EncodeDouble(double value)
+    private static byte EncodeDoubleBitwise(double value)
     {
         // Special cases
         if (value == 0.0) return 0;
         if (double.IsNaN(value) || double.IsInfinity(value)) return NaR;
-        
+
         // Extract IEEE 754 components
         ulong doubleBits = BitConverter.DoubleToUInt64Bits(value);
         bool sign = (doubleBits >> 63) != 0;
         int expField = (int)((doubleBits >> 52) & 0x7FF);
         ulong mantissa = doubleBits & 0xFFFFFFFFFFFFF;
-        
+
         // Handle denormals
         if (expField == 0) return 0; // Underflow to zero
-        
+
         // Compute actual exponent (unbias)
         int exponent = expField - 1023;
-        
+
         // For Posit: scale = exponent
         int scale = exponent;
-        
+
         // Compute regime and exponent bit
         // regime_k = floor(scale / 2), exp_bit = scale % 2
-        int regimeK = scale >> 1; // Arithmetic right shift
+        int regimeK = scale >= 0 ? scale >> 1 : -(((-scale) + 1) >> 1);
         int expBit = scale & 1;
-        
+
         // Build regime bit pattern
         int regimeLen;
         uint regimeBits;
-        
+
         if (regimeK >= 0)
         {
             regimeLen = regimeK + 2; // k+1 ones, then terminating zero
@@ -218,61 +212,104 @@ public static class Posit8Tables
         // Calculate available fraction bits
         int fracBitsAvailable = 7 - regimeLen - 1; // -1 for exponent bit
 
-        if (fracBitsAvailable < -1)
+        if (fracBitsAvailable < 0)
         {
-            // Not enough space even for regime - underflow to zero
-            return 0;
+            // Not enough space for fraction - need to check if we should round up
+            // by looking at the implicit 1 bit of the mantissa
+            bool shouldRoundUp = false;
+
+            if (fracBitsAvailable == -1)
+            {
+                // No fraction bits, but we have exponent bit
+                // Check if we should round based on mantissa
+                shouldRoundUp = (mantissa >> 51) >= 1; // Check MSB of mantissa
+            }
+
+            // Assemble without fraction
+            uint bits = 0;
+            int pos = 6;
+
+            bits |= regimeBits << (pos - regimeLen + 1);
+            pos -= regimeLen;
+
+            if (pos >= 0)
+            {
+                bits |= (uint)(expBit << pos);
+            }
+
+            // Round up if needed
+            if (shouldRoundUp && bits < 0x7F)
+            {
+                bits++;
+            }
+
+            if (sign)
+            {
+                bits = (uint)(-(int)bits) & 0xFF;
+            }
+
+            return (byte)bits;
         }
-        
+
         // Assemble the Posit bit pattern
         uint positBits = 0;
         int bitPos = 6; // Start after sign bit
-        
+
         // Place regime bits
         positBits |= regimeBits << (bitPos - regimeLen + 1);
         bitPos -= regimeLen;
-        
-        // Place exponent bit (if space)
-        if (bitPos >= 0)
+
+        // Place exponent bit
+        positBits |= (uint)(expBit << bitPos);
+        bitPos--;
+
+        // Place fraction bits
+        int fracBits = bitPos + 1;
+        // Extract top fracBits from IEEE mantissa (52 bits)
+        uint frac = (uint)(mantissa >> (52 - fracBits));
+
+        // Round to nearest (check bit after truncation)
+        bool roundUp = false;
+        if (fracBits < 52)
         {
-            positBits |= (uint)(expBit << bitPos);
-            bitPos--;
-        }
-        
-        // Place fraction bits (if space)
-        if (bitPos >= 0)
-        {
-            int fracBits = bitPos + 1;
-            // Extract top fracBits from IEEE mantissa (52 bits)
-            uint frac = (uint)(mantissa >> (52 - fracBits));
-            
-            // Round to nearest (check bit after truncation)
-            if (fracBits < 52)
+            int roundBit = 52 - fracBits - 1;
+            if (roundBit >= 0)
             {
-                int roundBit = 52 - fracBits - 1;
-                if (roundBit >= 0 && ((mantissa >> roundBit) & 1) != 0)
+                ulong roundBitValue = (mantissa >> roundBit) & 1;
+                if (roundBitValue != 0)
                 {
-                    // Round up if next bit is 1
-                    frac++;
-                    // Handle overflow from rounding
-                    if (frac >= (1u << fracBits))
+                    // Round to nearest, ties to even
+                    ulong stickyBits = roundBit > 0 ? mantissa & ((1UL << roundBit) - 1) : 0;
+                    if (stickyBits != 0 || (frac & 1) != 0)
                     {
-                        // Rounding overflowed, need to increment larger fields
-                        // For simplicity, just truncate for now
-                        frac = (1u << fracBits) - 1;
+                        roundUp = true;
                     }
                 }
             }
-            
-            positBits |= frac;
         }
-        
+
+        positBits |= frac;
+
+        // Handle rounding with proper carry propagation
+        if (roundUp)
+        {
+            // Increment the entire posit value (before sign application)
+            // This naturally handles carry through fraction -> exponent -> regime
+            positBits++;
+
+            // Check for overflow to max value
+            if (positBits >= 0x80)
+            {
+                positBits = 0x7F; // Clamp to max positive value
+            }
+        }
+
         // Apply two's complement for negative values
         if (sign)
         {
             positBits = (uint)(-(int)positBits) & 0xFF;
         }
-        
+
         return (byte)positBits;
     }
     
@@ -285,85 +322,144 @@ public static class Posit8Tables
         if (a == NaR || b == NaR) return NaR;
         if (a == 0) return b;
         if (b == 0) return a;
-        
+
         double sum = ToDoubleTable[a] + ToDoubleTable[b];
-        return EncodeDouble(sum);
+        return EncodeDoubleBitwise(sum);
     }
-    
+
     private static byte ComputeMul(byte a, byte b)
     {
         if (a == NaR || b == NaR) return NaR;
         if (a == 0 || b == 0) return 0;
-        
+
         double product = ToDoubleTable[a] * ToDoubleTable[b];
-        return EncodeDouble(product);
+        return EncodeDoubleBitwise(product);
     }
-    
+
     private static byte ComputeSub(byte a, byte b)
     {
         if (a == NaR || b == NaR) return NaR;
-        
+
         double diff = ToDoubleTable[a] - ToDoubleTable[b];
-        return EncodeDouble(diff);
+        return EncodeDoubleBitwise(diff);
     }
-    
+
     private static byte ComputeDiv(byte a, byte b)
     {
         if (a == NaR || b == NaR) return NaR;
         if (b == 0) return NaR; // Division by zero
         if (a == 0) return 0;
-        
+
         double quotient = ToDoubleTable[a] / ToDoubleTable[b];
-        return EncodeDouble(quotient);
+        return EncodeDoubleBitwise(quotient);
     }
-    
+
     private static byte ComputeRecip(byte p)
     {
         if (p == NaR || p == 0) return NaR;
-        
+
         double recip = 1.0 / ToDoubleTable[p];
-        return EncodeDouble(recip);
+        return EncodeDoubleBitwise(recip);
     }
     
     #endregion
     
     #region Public API - O(1) Operations
-    
+
+    /// <summary>
+    /// Decode a Posit8 byte to double using lookup table. O(1) operation.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ToDouble(byte posit) => ToDoubleTable[posit];
+
+    /// <summary>
+    /// Encode a double to Posit8 using pure bit operations.
+    /// Uses proper rounding according to posit standard.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static byte EncodeDouble(double value) => EncodeDoubleBitwise(value);
     
+    /// <summary>
+    /// Add two Posit8 values. O(1) table lookup operation.
+    /// </summary>
+    /// <param name="a">First operand</param>
+    /// <param name="b">Second operand</param>
+    /// <returns>Result of a + b in Posit8 format</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Add(byte a, byte b) => AddTable[a, b];
-    
+
+    /// <summary>
+    /// Multiply two Posit8 values. O(1) table lookup operation.
+    /// </summary>
+    /// <param name="a">First operand</param>
+    /// <param name="b">Second operand</param>
+    /// <returns>Result of a * b in Posit8 format</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Mul(byte a, byte b) => MulTable[a, b];
-    
+
+    /// <summary>
+    /// Subtract two Posit8 values. O(1) table lookup operation.
+    /// </summary>
+    /// <param name="a">First operand</param>
+    /// <param name="b">Second operand</param>
+    /// <returns>Result of a - b in Posit8 format</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Sub(byte a, byte b) => SubTable[a, b];
-    
+
+    /// <summary>
+    /// Divide two Posit8 values. O(1) table lookup operation.
+    /// Returns NaR (0x80) if b is zero.
+    /// </summary>
+    /// <param name="a">Numerator</param>
+    /// <param name="b">Denominator</param>
+    /// <returns>Result of a / b in Posit8 format, or NaR if division by zero</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Div(byte a, byte b) => DivTable[a, b];
-    
+
+    /// <summary>
+    /// Negate a Posit8 value using two's complement. O(1) operation.
+    /// </summary>
+    /// <param name="posit">Value to negate</param>
+    /// <returns>Negated value (-posit)</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Neg(byte posit) => NegTable[posit];
-    
+
+    /// <summary>
+    /// Get absolute value of a Posit8. O(1) operation.
+    /// Returns NaR unchanged.
+    /// </summary>
+    /// <param name="posit">Input value</param>
+    /// <returns>Absolute value</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Abs(byte posit) => AbsTable[posit];
-    
+
+    /// <summary>
+    /// Calculate reciprocal (1/x) of a Posit8 value. O(1) operation.
+    /// Returns NaR for zero or NaR input.
+    /// </summary>
+    /// <param name="posit">Input value</param>
+    /// <returns>Reciprocal (1/posit), or NaR if input is zero or NaR</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte Recip(byte posit) => RecipTable[posit];
     
     /// <summary>
-    /// Compare two posits: returns -1 if a < b, 0 if equal, 1 if a > b
+    /// Compare two Posit8 values.
+    /// Returns -1 if a &lt; b, 0 if equal, 1 if a &gt; b.
+    /// NaR comparison returns 0 (undefined).
     /// </summary>
+    /// <param name="a">First value to compare</param>
+    /// <param name="b">Second value to compare</param>
+    /// <returns>-1 if a &lt; b, 0 if equal or NaR involved, 1 if a &gt; b</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Compare(byte a, byte b)
     {
         if (a == NaR || b == NaR) return 0; // NaR comparison undefined
-        
-        // Posit comparison: flip sign bit, then signed compare
-        sbyte sa = (sbyte)(a ^ 0x80);
-        sbyte sb = (sbyte)(b ^ 0x80);
+
+        // Posit uses two's complement: just cast to signed byte and compare
+        // Negative values (0x81-0xFF) are -127 to -1
+        // Positive values (0x01-0x7F) are 1 to 127
+        sbyte sa = (sbyte)a;
+        sbyte sb = (sbyte)b;
         return sa.CompareTo(sb);
     }
     
@@ -372,31 +468,43 @@ public static class Posit8Tables
     #region SIMD Batch Operations
     
     /// <summary>
-    /// SIMD-accelerated vector addition: c[i] = a[i] + b[i]
-    /// Processes 32 elements at a time with AVX2.
+    /// Element-wise vector addition: result[i] = a[i] + b[i].
+    /// Uses table lookups for O(1) per-element operations.
     /// </summary>
+    /// <param name="a">First input vector</param>
+    /// <param name="b">Second input vector</param>
+    /// <param name="result">Output vector (must be same length as inputs)</param>
+    /// <exception cref="ArgumentException">Thrown if vector lengths don't match</exception>
     public static void AddVector(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, Span<byte> result)
     {
-        if (a.Length != b.Length || a.Length != result.Length)
-            throw new ArgumentException("All spans must have same length");
-        
+        if (a.Length != b.Length)
+            throw new ArgumentException(
+                $"Vector length mismatch: vector 'a' has {a.Length} elements, vector 'b' has {b.Length} elements",
+                nameof(b));
+
+        if (a.Length != result.Length)
+            throw new ArgumentException(
+                $"Result vector length mismatch: expected {a.Length} elements to match input vectors, got {result.Length}",
+                nameof(result));
+
         int i = 0;
-        
-        // AVX2: Process 32 bytes at once
-        if (Avx2.IsSupported && a.Length >= 32)
+
+        // Process 8 elements at a time with loop unrolling
+        // This allows CPU to pipeline multiple table lookups in parallel
+        int unrollLength = a.Length - (a.Length % 8);
+        for (; i < unrollLength; i += 8)
         {
-            for (; i <= a.Length - 32; i += 32)
-            {
-                // This is where lookup tables shine - we just do 32 lookups
-                // Real optimization would use VPGATHERDD, but for clarity:
-                for (int j = 0; j < 32; j++)
-                {
-                    result[i + j] = AddTable[a[i + j], b[i + j]];
-                }
-            }
+            result[i] = AddTable[a[i], b[i]];
+            result[i + 1] = AddTable[a[i + 1], b[i + 1]];
+            result[i + 2] = AddTable[a[i + 2], b[i + 2]];
+            result[i + 3] = AddTable[a[i + 3], b[i + 3]];
+            result[i + 4] = AddTable[a[i + 4], b[i + 4]];
+            result[i + 5] = AddTable[a[i + 5], b[i + 5]];
+            result[i + 6] = AddTable[a[i + 6], b[i + 6]];
+            result[i + 7] = AddTable[a[i + 7], b[i + 7]];
         }
-        
-        // Scalar fallback
+
+        // Handle remaining elements
         for (; i < a.Length; i++)
         {
             result[i] = AddTable[a[i], b[i]];
@@ -404,90 +512,69 @@ public static class Posit8Tables
     }
     
     /// <summary>
-    /// Dot product using posit8 lookup tables.
-    /// Accumulates in double space to maintain precision.
+    /// Compute dot product of two Posit8 vectors with double precision accumulation.
+    /// Decodes inputs to double, multiplies, and accumulates without intermediate rounding.
+    /// Provides best accuracy by only quantizing inputs, not intermediate results.
     /// </summary>
+    /// <param name="a">First input vector</param>
+    /// <param name="b">Second input vector (must be same length as a)</param>
+    /// <returns>Dot product as double precision value</returns>
+    /// <exception cref="ArgumentException">Thrown if vector lengths don't match</exception>
     public static double DotProduct(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
         if (a.Length != b.Length)
-            throw new ArgumentException("Vectors must have same length");
+            throw new ArgumentException(
+                $"Vector length mismatch: vector 'a' has {a.Length} elements, vector 'b' has {b.Length} elements",
+                nameof(b));
 
         double sum = 0.0;
 
         for (int i = 0; i < a.Length; i++)
         {
-            byte prod = MulTable[a[i], b[i]];
-            sum += ToDoubleTable[prod];
+            // Decode once, multiply in double precision
+            // Avoids intermediate rounding that MulTable would introduce
+            double aVal = ToDoubleTable[a[i]];
+            double bVal = ToDoubleTable[b[i]];
+            sum += aVal * bVal;
         }
 
         return sum;
     }
 
     /// <summary>
-    /// Dot product using pure posit8 arithmetic.
-    /// Accumulates in posit8 space using AddTable - faster but less precise.
+    /// Matrix multiplication C = A * B with double precision accumulation.
+    /// Decodes inputs to double, multiplies, and accumulates without intermediate rounding.
+    /// Only rounds once at the end - provides best accuracy for Posit8 matrix multiplication.
+    /// Recommended for most use cases.
     /// </summary>
-    public static byte DotProductPosit8(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
-    {
-        if (a.Length != b.Length)
-            throw new ArgumentException("Vectors must have same length");
-
-        byte accumulator = 0;
-
-        for (int i = 0; i < a.Length; i++)
-        {
-            byte prod = MulTable[a[i], b[i]];
-            accumulator = AddTable[accumulator, prod];
-        }
-
-        return accumulator;
-    }
-    
-    /// <summary>
-    /// Matrix multiplication: C = A * B (posit8 byte accumulation)
-    /// A: [m x k], B: [k x n], C: [m x n]
-    /// </summary>
-    public static void MatMul(ReadOnlySpan<byte> A, ReadOnlySpan<byte> B, Span<byte> C,
-                              int m, int k, int n)
-    {
-        if (A.Length != m * k || B.Length != k * n || C.Length != m * n)
-            throw new ArgumentException("Invalid matrix dimensions");
-
-        C.Clear(); // Initialize to zero
-
-        for (int row = 0; row < m; row++)
-        {
-            for (int col = 0; col < n; col++)
-            {
-                byte accumulator = 0; // Start with zero
-
-                for (int i = 0; i < k; i++)
-                {
-                    byte a_elem = A[row * k + i];
-                    byte b_elem = B[i * n + col];
-
-                    // Multiply using lookup table
-                    byte product = MulTable[a_elem, b_elem];
-
-                    // Add to accumulator using lookup table
-                    accumulator = AddTable[accumulator, product];
-                }
-
-                C[row * n + col] = accumulator;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Matrix multiplication: C = A * B (double accumulation for better precision)
-    /// A: [m x k], B: [k x n], C: [m x n]
-    /// Results stored as posit8 but accumulated in double space.
-    /// </summary>
+    /// <param name="A">Input matrix A (m x k), row-major order</param>
+    /// <param name="B">Input matrix B (k x n), row-major order</param>
+    /// <param name="C">Output matrix C (m x n), row-major order</param>
+    /// <param name="m">Number of rows in A</param>
+    /// <param name="k">Number of columns in A / rows in B</param>
+    /// <param name="n">Number of columns in B</param>
+    /// <exception cref="ArgumentException">Thrown if matrix dimensions don't match</exception>
     public static void MatMulDouble(ReadOnlySpan<byte> A, ReadOnlySpan<byte> B, Span<byte> C,
                                     int m, int k, int n)
     {
-        if (A.Length != m * k || B.Length != k * n || C.Length != m * n)
-            throw new ArgumentException("Invalid matrix dimensions");
+        int expectedA = m * k;
+        int expectedB = k * n;
+        int expectedC = m * n;
+
+        if (A.Length != expectedA)
+            throw new ArgumentException(
+                $"Matrix A dimension mismatch: expected {m}×{k} = {expectedA} elements, got {A.Length}",
+                nameof(A));
+
+        if (B.Length != expectedB)
+            throw new ArgumentException(
+                $"Matrix B dimension mismatch: expected {k}×{n} = {expectedB} elements, got {B.Length}",
+                nameof(B));
+
+        if (C.Length != expectedC)
+            throw new ArgumentException(
+                $"Matrix C dimension mismatch: expected {m}×{n} = {expectedC} elements, got {C.Length}",
+                nameof(C));
 
         for (int row = 0; row < m; row++)
         {
@@ -500,14 +587,77 @@ public static class Posit8Tables
                     byte a_elem = A[row * k + i];
                     byte b_elem = B[i * n + col];
 
-                    byte product = MulTable[a_elem, b_elem];
-                    accumulator += ToDoubleTable[product];
+                    // Decode and multiply in double precision
+                    // Avoids intermediate rounding that MulTable would introduce
+                    double aVal = ToDoubleTable[a_elem];
+                    double bVal = ToDoubleTable[b_elem];
+                    accumulator += aVal * bVal;
                 }
 
+                // Round only once at the end
                 C[row * n + col] = EncodeDouble(accumulator);
             }
         }
     }
-    
+
+    /// <summary>
+    /// Parallel matrix multiplication C = A * B with double precision accumulation.
+    /// Uses multiple CPU cores for better performance on larger matrices.
+    /// Recommended for matrices larger than 128x128.
+    /// Note: Uses arrays instead of Spans to allow parallelization.
+    /// </summary>
+    /// <param name="A">Input matrix A (m x k), row-major order</param>
+    /// <param name="B">Input matrix B (k x n), row-major order</param>
+    /// <param name="C">Output matrix C (m x n), row-major order</param>
+    /// <param name="m">Number of rows in A</param>
+    /// <param name="k">Number of columns in A / rows in B</param>
+    /// <param name="n">Number of columns in B</param>
+    /// <exception cref="ArgumentException">Thrown if matrix dimensions don't match</exception>
+    public static void MatMulDoubleParallel(byte[] A, byte[] B, byte[] C,
+                                            int m, int k, int n)
+    {
+        int expectedA = m * k;
+        int expectedB = k * n;
+        int expectedC = m * n;
+
+        if (A.Length != expectedA)
+            throw new ArgumentException(
+                $"Matrix A dimension mismatch: expected {m}×{k} = {expectedA} elements, got {A.Length}",
+                nameof(A));
+
+        if (B.Length != expectedB)
+            throw new ArgumentException(
+                $"Matrix B dimension mismatch: expected {k}×{n} = {expectedB} elements, got {B.Length}",
+                nameof(B));
+
+        if (C.Length != expectedC)
+            throw new ArgumentException(
+                $"Matrix C dimension mismatch: expected {m}×{n} = {expectedC} elements, got {C.Length}",
+                nameof(C));
+
+        // Parallel processing of rows
+        Parallel.For(0, m, row =>
+        {
+            for (int col = 0; col < n; col++)
+            {
+                double accumulator = 0.0;
+
+                for (int i = 0; i < k; i++)
+                {
+                    byte a_elem = A[row * k + i];
+                    byte b_elem = B[i * n + col];
+
+                    // Decode and multiply in double precision
+                    double aVal = ToDoubleTable[a_elem];
+                    double bVal = ToDoubleTable[b_elem];
+                    accumulator += aVal * bVal;
+                }
+
+                // Round only once at the end
+                C[row * n + col] = EncodeDouble(accumulator);
+            }
+        });
+    }
+
     #endregion
 }
